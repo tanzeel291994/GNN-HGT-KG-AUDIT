@@ -1,0 +1,1 @@
+poetry run python -m ipykernel install --user --name gnn-hgt --display-name "Python (gnn-hgt)"
