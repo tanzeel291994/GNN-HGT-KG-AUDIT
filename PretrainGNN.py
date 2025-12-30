@@ -44,7 +44,7 @@ class PretrainableHeteroGNN(nn.Module):
         h_dict = x_dict
         for conv in self.convs:
             h_dict = conv(h_dict, edge_index_dict)
-            h_dict = {k: F.gelu(v) for k, v in h_dict.items()}
+            h_dict = {k: F.gelu(v) for k, v in h_dict.items()} #Gaussian Error Linear Unit is a non-linear activation function that is used to introduce non-linearity into the model.
         
         # Focus on 'entity' nodes for global reasoning and contrastive learning
         h_local_ent = h_dict['entity']
@@ -119,7 +119,7 @@ from torch_geometric.loader import NeighborLoader
 # ... (PretrainableHeteroGNN and get_graph_augmentation remain same) ...
 
 # --- 4. PRE-TRAINING LOOP ---
-def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda', batch_size=2048):
+def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda', batch_size=1024):
     print(f"Loading graph to CPU...")
     data = torch.load(graph_path, weights_only=False, map_location='cpu')
     
@@ -140,7 +140,7 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
         batch_size=batch_size,
         input_nodes='entity',
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         persistent_workers=True
     )
 
@@ -179,8 +179,8 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
             
             # Aggressive cleanup for large embeddings
             del view1, view2, z1, z2, batch
-            if num_batches % 20 == 0:
-                torch.cuda.empty_cache()
+            #if num_batches % 20 == 0:
+            #    torch.cuda.empty_cache()
 
         duration = time.time() - start_time
         avg_loss = total_loss / num_batches
@@ -193,9 +193,11 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
     print("Pre-training completed and model saved.")
 
 if __name__ == "__main__":
-    GRAPH_PATH = "/home/ubuntu/gnn-hgt/GNN-HGT-KG-AUDIT/kg_storage/global_graph.pt"
-    HIDDEN_DIM = 4096 # Updated for NVIDIA NV-Embed-v2
-    OUT_DIM = 256     # Contrastive projection dimension
+    #GRAPH_PATH = "/home/ubuntu/gnn-hgt/GNN-HGT-KG-AUDIT/kg_storage/global_graph.pt"
+    GRAPH_PATH = "/home/ubuntu/gnn-hgt/GNN-HGT-KG-AUDIT/kg_storage/global_graph_bge_small.pt"
+
+    HIDDEN_DIM = 384 # Updated for NVIDIA NV-Embed-v2
+    OUT_DIM = 128     # Contrastive projection dimension
     
     # Use CUDA if available
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -211,5 +213,5 @@ if __name__ == "__main__":
                 HIDDEN_DIM = actual_dim
         del temp_data
     
-    pretrain(GRAPH_PATH, HIDDEN_DIM, OUT_DIM, epochs=2, lr=1e-3, device=device, batch_size=256)
+    pretrain(GRAPH_PATH, HIDDEN_DIM, OUT_DIM, epochs=20, lr=1e-3, device=device, batch_size=1024)
 

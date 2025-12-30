@@ -25,7 +25,7 @@ from torch_geometric.nn.models import SGFormer
 # This prevents the root __init__.py from crashing when you import OpenIE.
 #sys.modules["vllm"] = MagicMock()
 #sys.modules["qsgnn_rag.QSGNNRAG"] = MagicMock()
-os.environ["OPENAI_API_KEY"] = ""
+#os.environ["OPENAI_API_KEY"] = ""
 # 3. Now you can use the standard import! 
 # It will no longer crash or complain about missing parent packages.
 #from qsgnn_rag.information_extraction.openie_openai import OpenIE
@@ -122,61 +122,60 @@ class SimpleAzureOpenIE:
 
 class NVEmbedV2EmbeddingModel:
     def __init__(self, model_name: str = "nvidia/NV-Embed-v2"):
-        from transformers import AutoModel
+        from transformers import AutoModel, AutoTokenizer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Loading {model_name} on {self.device}...")
         
-        # NV-Embed-v2 requires trust_remote_code=True
-        # We use AutoModel directly because SentenceTransformer has compatibility issues with its output format
-        self.model = AutoModel.from_pretrained(
-            model_name, 
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16
-        ).to(self.device)
+        # Check if it's an NV-Embed model or a standard Sentence Transformer / BGE model
+        self.is_nv_embed = "NV-Embed" in model_name
+        
+        if self.is_nv_embed:
+            self.model = AutoModel.from_pretrained(
+                model_name, 
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16
+            ).to(self.device)
+        else:
+            # Fallback to SentenceTransformer for smaller models
+            from sentence_transformers import SentenceTransformer
+            self.model = SentenceTransformer(model_name, device=self.device)
+        
         self.model.eval()
-
-    # def batch_encode(self, texts: List[str], instruction: str = "passage", batch_size: int = 4) -> np.ndarray:
-    #     if isinstance(texts, str): texts = [texts]
-        
-    #     # NV-Embed-v2 has a native encode method when loaded with trust_remote_code=True
-    #     with torch.no_grad():
-    #         embeddings = self.model.encode(
-    #             texts, 
-    #             instruction=instruction,
-    #             batch_size=batch_size
-    #         )
-        
-    #     if torch.is_tensor(embeddings):
-    #         return embeddings.cpu().numpy()
-    #     return embeddings
 
     def batch_encode(self, texts: List[str], instruction: str = "passage", batch_size: int = 4) -> np.ndarray:
         if isinstance(texts, str): texts = [texts]
         
-        all_embeddings = []
-        
-        # Use tqdm to show progress and ETA
-        # The 'desc' tells you which part of the graph is being embedded
-        from tqdm import tqdm
-        pbar = tqdm(total=len(texts), desc=f"Embedding {instruction}s", unit="text")
-        
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            with torch.no_grad():
-                embeddings = self.model.encode(
-                    batch, 
-                    instruction=instruction,
-                    batch_size=batch_size
-                )
+        if self.is_nv_embed:
+            all_embeddings = []
+            from tqdm import tqdm
+            pbar = tqdm(total=len(texts), desc=f"Embedding {instruction}s", unit="text")
+            
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                with torch.no_grad():
+                    embeddings = self.model.encode(
+                        batch, 
+                        instruction=instruction,
+                        batch_size=batch_size
+                    )
+                    
+                    if torch.is_tensor(embeddings):
+                        embeddings = embeddings.cpu().numpy()
+                    all_embeddings.append(embeddings)
                 
-                if torch.is_tensor(embeddings):
-                    embeddings = embeddings.cpu().numpy()
-                all_embeddings.append(embeddings)
-            
-            pbar.update(len(batch))
-            
-        pbar.close()
-        return np.vstack(all_embeddings)
+                pbar.update(len(batch))
+            pbar.close()
+            return np.vstack(all_embeddings)
+        else:
+            # Standard SentenceTransformer encode
+            # BGE models often use prompts/instructions too
+            # We'll use a simple approach for the POC
+            return self.model.encode(
+                texts, 
+                batch_size=batch_size, 
+                show_progress_bar=True,
+                convert_to_numpy=True
+            )
 
 # --- 2. AUDITABLE HYBRID GNN MODEL ---
 class AuditableHybridGNN(nn.Module):
@@ -211,15 +210,15 @@ class AuditableHybridGNN(nn.Module):
         
         # 2. Global Entity Reasoning (Self-Attention among entities)
         h_local_ent = h_dict['entity']
-        #entities_batch = h_local_ent.unsqueeze(0) # [1, N, D]
-        #h_ent_global, _ = self.entity_global_attn(entities_batch, entities_batch, entities_batch)
-        # Create an empty edge index for SGFormer's requirement
-        empty_edge_index = torch.empty((2, 0), dtype=torch.long, device=h_local_ent.device)
-        # SGFormer performs linear attention, avoiding the N^2 memory bottleneck
-        h_ent_global = self.entity_global_reasoner(h_local_ent, empty_edge_index)
+        # Create the missing batch vector for SGFormer (all nodes in one graph instance)
+        batch_ent = h_local_ent.new_zeros(h_local_ent.size(0), dtype=torch.long)
+        
+        # Call .trans_conv directly to get RAW features (no log_softmax)
+        # This mirrors the logic in the pre-training script for high-quality features
+        h_ent_global = self.entity_global_reasoner.trans_conv(h_local_ent, batch_ent)
         
         # Residual connection and normalization
-        h_dict['entity'] = self.entity_norm((1 - self.alpha) * h_local_ent + self.alpha * h_ent_global.squeeze(0))
+        h_dict['entity'] = self.entity_norm((1 - self.alpha) * h_local_ent + self.alpha * h_ent_global)
         
         # 3. Query-Guided Broadcast (Update Passages based on Query-Relevant Entities)
         e2p_index = edge_index_dict[('entity', 'in', 'passage')]
@@ -428,14 +427,19 @@ class POCGraphBuilder:
         data['passage', 'hv', 'sentence'].edge_attr = structural_rel_emb["hv"].repeat(len(s2p_edges), 1)
 
         # C. Entity <-> Sentence
-        # e2s_edges = []
-        # for s_idx, s_info in enumerate(all_sentences_info):
-        #     for ent in s_info['entities']:
-        #         e2s_edges.append([ent_to_idx[ent], s_idx])
+        e2s_edges = []
+        for s_idx, s_info in enumerate(all_sentences_info):
+            for ent in s_info['entities']:
+                # Re-sanitize to match keys in ent_to_idx
+                ent_str = ent if isinstance(ent, str) else str(ent)
+                if ent_str in ent_to_idx:
+                    e2s_edges.append([ent_to_idx[ent_str], s_idx])
         
-        # if e2s_edges:
-        #     data['entity', 'in', 'sentence'].edge_index = torch.tensor(e2s_edges).t().contiguous()
-        #     data['sentence', 'hv', 'entity'].edge_index = data['entity', 'in', 'sentence'].edge_index.flip(0)
+        if e2s_edges:
+            data['entity', 'in', 'sentence'].edge_index = torch.tensor(e2s_edges).t().contiguous()
+            data['sentence', 'hv', 'entity'].edge_index = data['entity', 'in', 'sentence'].edge_index.flip(0)
+            data['entity', 'in', 'sentence'].edge_attr = structural_rel_emb["in"].repeat(len(e2s_edges), 1)
+            data['sentence', 'hv', 'entity'].edge_attr = structural_rel_emb["hv"].repeat(len(e2s_edges), 1)
 
         # D. Entity <-> Passage
         e2p_edges = []
@@ -523,8 +527,8 @@ def evaluate_retrieval(model, builder, samples, embed_model, k_list=[1, 5]):
 if __name__ == "__main__":
     # 1. Configuration
     azure_config = {
-        "api_key": "",
-        "endpoint": "",
+        "api_key": "db8dac9cea3148d48c348ed46e9bfb2d",
+        "endpoint": "https://bodeu-des-csv02.openai.azure.com/",
         "api_version": "2024-12-01-preview", 
         "deployment_name": "gpt-4o-mini" 
     }

@@ -9,8 +9,8 @@ class GlobalKGManager:
     def __init__(self, storage_dir="kg_storage"):
         self.storage_dir = storage_dir
         os.makedirs(storage_dir, exist_ok=True)
-        self.graph_path = os.path.join(storage_dir, "global_graph.pt")
-        self.meta_path = os.path.join(storage_dir, "metadata.json")
+        self.graph_path = os.path.join(storage_dir, "global_graph_bge_small.pt")
+        self.meta_path = os.path.join(storage_dir, "metadata_bge_small.json")
 
     def save_kg(self, data, entity_map, doc_map):
         # Save the PyG HeteroData object
@@ -46,8 +46,12 @@ if __name__ == "__main__":
     corpus_path = "dataset/musique_corpus.json"
     
     # 2. Init Tools
-    #embed_model = NVEmbedV2EmbeddingModel("sentence-transformers/all-MiniLM-L6-v2")
-    embed_model = NVEmbedV2EmbeddingModel("nvidia/NV-Embed-v2")
+    # Choice 1: Smaller, faster model (384 dim) - Recommended for avoiding OOM
+    model_name = "BAAI/bge-small-en-v1.5"
+    # Choice 2: Medium model (768 dim)
+    # model_name = "BAAI/bge-base-en-v1.5"
+    
+    embed_model = NVEmbedV2EmbeddingModel(model_name)
     builder = POCGraphBuilder(embed_model, azure_config, cache_path="musique_ie_cache.json")
     manager = GlobalKGManager()
 
