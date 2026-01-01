@@ -8,6 +8,9 @@ from torch_geometric.data import HeteroData
 import copy
 from tqdm import tqdm
 import time
+from torch_geometric.loader import HGTLoader  
+#from torch_geometric.loader import NeighborLoader
+
 
 # --- 1. MODEL DEFINITION ---
 class PretrainableHeteroGNN(nn.Module):
@@ -110,11 +113,10 @@ def contrastive_loss(z1, z2, temperature=0.1, max_nodes=5000):
         z2 = z2[indices]
     
     batch_size = z1.size(0)
-    sim_matrix = torch.mm(z1, z2.t()) / temperature
-    labels = torch.arange(batch_size, device=z1.device)
+    sim_matrix = torch.mm(z1, z2.t()) / temperature # z1 n x d and z2 n x d
+    labels = torch.arange(batch_size, device=z1.device) # n x n 
     return F.cross_entropy(sim_matrix, labels)
 
-from torch_geometric.loader import NeighborLoader
 
 # ... (PretrainableHeteroGNN and get_graph_augmentation remain same) ...
 
@@ -132,18 +134,18 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
     model = PretrainableHeteroGNN(data.metadata(), hidden_dim, out_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    # Create a NeighborLoader for the 'entity' nodes
-    # Reduced num_neighbors to fit 4096-dim features in memory
-    train_loader = NeighborLoader(
+    # Create a HGTLoader for the 'entity' nodes
+    # NOTE: In HGTLoader, num_samples is the TOTAL budget of nodes per type per hop for the ENTIRE batch.
+    # [10, 5] was way too small for a batch_size of 1024, leaving nodes isolated.
+    train_loader = HGTLoader(
         data,
-        num_neighbors=[10, 5], 
+        num_samples=[2048, 1024], # Increased budget to provide structural context
         batch_size=batch_size,
         input_nodes='entity',
         shuffle=True,
         num_workers=8,
         persistent_workers=True
     )
-
     print(f"Starting Sub-graph Pre-training...")
     model.train()
     
@@ -160,13 +162,16 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
         for batch in pbar:
             optimizer.zero_grad()
             
+            # Use actual batch size for slicing (important for the last batch)
+            curr_batch_size = batch['entity'].batch_size
+            
             # Generate views and move to device (standard float32)
             view1 = get_graph_augmentation(batch).to(device)
             view2 = get_graph_augmentation(batch).to(device)
             
             # Run in pure float32 for maximum compatibility with pyg-lib kernels
-            z1 = model(view1.x_dict, view1.edge_index_dict)[:batch_size]
-            z2 = model(view2.x_dict, view2.edge_index_dict)[:batch_size]
+            z1 = model(view1.x_dict, view1.edge_index_dict)[:curr_batch_size]
+            z2 = model(view2.x_dict, view2.edge_index_dict)[:curr_batch_size]
             
             loss = contrastive_loss(z1, z2)
             

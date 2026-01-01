@@ -179,14 +179,17 @@ class NVEmbedV2EmbeddingModel:
 
 # --- 2. AUDITABLE HYBRID GNN MODEL ---
 class AuditableHybridGNN(nn.Module):
-    def __init__(self, metadata, hidden_dim):
+    def __init__(self, metadata, hidden_dim, num_layers=2):
         super().__init__()
         self.hidden_dim = hidden_dim
         
-        # 1. Local Structural Reasoning (HGT)
-        self.local_hgt = HGTConv(hidden_dim, hidden_dim, metadata, heads=4)
+        # 1. BACKBONE: Local Structural Reasoning (HGT)
+        # Renamed to 'convs' to match PretrainableHeteroGNN for weight loading
+        self.convs = nn.ModuleList()
+        for _ in range(num_layers):
+            self.convs.append(HGTConv(hidden_dim, hidden_dim, metadata, heads=4))
         
-        # 2. Global Entity Reasoning (SGFormer Transformer)
+        # 2. BACKBONE: Global Entity Reasoning (SGFormer Transformer)
         self.entity_global_reasoner = SGFormer(
             in_channels=hidden_dim,
             hidden_channels=hidden_dim,
@@ -203,9 +206,12 @@ class AuditableHybridGNN(nn.Module):
         self.alpha = 0.1
         
         # --- 3. TASK-SPECIFIC LAYERS (The ones we fine-tune) ---
-        # Query Aligner: Projects query into the pre-trained entity semantic space
-        self.query_aligner = nn.Linear(hidden_dim, hidden_dim)
-        
+        self.relevance_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
         # Final Scoring Head: Document relevance prediction
         self.scoring_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -213,12 +219,46 @@ class AuditableHybridGNN(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
+    def load_backbone(self, checkpoint_path, device='cpu', freeze=True):
+        """
+        Loads pre-trained backbone weights (HGT, SGFormer, Norm) and optionally freezes them.
+        """
+        if not os.path.exists(checkpoint_path):
+            print(f"Warning: Backbone checkpoint {checkpoint_path} not found.")
+            return False
+            
+        print(f"Loading pretrained backbone from {checkpoint_path}...")
+        pretrained_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model_dict = self.state_dict()
+        
+        # Filter weights: match keys and shapes, exclude task-specific layers
+        load_dict = {
+            k: v for k, v in pretrained_dict.items() 
+            if k in model_dict and v.size() == model_dict[k].size()
+        }
+        
+        self.load_state_dict(load_dict, strict=False)
+        print(f"Successfully loaded {len(load_dict)} backbone layers.")
+        
+        if freeze:
+            # Freeze everything except the task-specific heads
+            task_heads = ['relevance_mlp', 'scoring_head', 'passage_norm']
+            frozen_count = 0
+            for name, param in self.named_parameters():
+                if not any(head in name for head in task_heads):
+                    param.requires_grad = False
+                    frozen_count += 1
+            print(f"Frozen {frozen_count} backbone parameters. Task heads {task_heads} remain trainable.")
+        return True
+
     def forward(self, x_dict, edge_index_dict, query_emb):
         if query_emb.dim() == 1:
             query_emb = query_emb.unsqueeze(0)
             
         # 1. BACKBONE: Local Structural Reasoning (HGT)
-        h_dict = self.local_hgt(x_dict, edge_index_dict)
+        h_dict = x_dict
+        for conv in self.convs:
+            h_dict = conv(h_dict, edge_index_dict)
         h_dict = {k: F.gelu(v) for k, v in h_dict.items()}
         
         # 2. BACKBONE: Global Entity Reasoning
@@ -230,14 +270,10 @@ class AuditableHybridGNN(nn.Module):
         h_dict['entity'] = self.entity_norm((1 - self.alpha) * h_local_ent + self.alpha * h_ent_global)
         
         # --- 3. FINE-TUNED LOGIC: Query-Guided Broadcast ---
-        #e2p_index = edge_index_dict[('entity', 'in', 'passage')]
-        #ent_idx, psg_idx = e2p_index
-
-        # Step A: Align query
-        q_aligned = self.query_aligner(query_emb)
-        q_expanded = q_aligned.expand(h_dict['entity'].size(0), -1)
-        relevance = torch.sum(h_dict['entity'] * q_expanded, dim=-1).sigmoid()
-
+        # Step A: Generate Entity Relevance
+        q_expanded = query_emb.expand(h_dict['entity'].size(0), -1)
+        relevance = self.relevance_mlp(torch.cat([h_dict['entity'], q_expanded], dim=-1)).squeeze()
+        
         # Step B: Entity -> Sentence (Local Context)
         e2s_index = edge_index_dict[('entity', 'in', 'sentence')]
         ent_idx, sent_idx = e2s_index
@@ -334,7 +370,7 @@ class POCGraphBuilder:
             if h not in self.cache and h not in unique_missing:
                 unique_missing[h] = idx
         
-        unique_missing={} # debug setting to empty array for now.
+        #unique_missing={} # debug setting to empty array for now.
         # 2. BATCH PROCESS MISSING CHUNKS
         if unique_missing:
             print(f"Processing {len(unique_missing)} unique new chunks through OpenIE...")
@@ -567,13 +603,17 @@ if __name__ == "__main__":
     # 3. Model Setup
     graph, _ = builder.build_graph(docs)
     hidden_dim = graph['passage'].x.shape[1]
-    model = AuditableHybridGNN(graph.metadata(), hidden_dim)
+    model = AuditableHybridGNN(graph.metadata(), hidden_dim, num_layers=2)
+    
+    # --- LOAD PRE-TRAINED BACKBONE ---
+    if not os.path.exists(checkpoint_path):
+        model.load_backbone("pretrained_gnn_final.pth", device=device, freeze=True)
     
     if os.path.exists(checkpoint_path):
         print(f"Loading existing model from {checkpoint_path}")
         model.load_state_dict(torch.load(checkpoint_path))
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0.001)
     criterion = nn.CrossEntropyLoss()
 
     # --- PHASE 1: ZERO-SHOT EVALUATION ---

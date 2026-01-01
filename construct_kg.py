@@ -43,7 +43,9 @@ if __name__ == "__main__":
         "deployment_name": "gpt-4o-mini" 
     }    
     
-    corpus_path = "dataset/musique_corpus.json"
+    #corpus_path = "dataset/musique_corpus.json"
+    corpus_path = "new_datasets/musique_corpus.json"
+
     
     # 2. Init Tools
     # Choice 1: Smaller, faster model (384 dim) - Recommended for avoiding OOM

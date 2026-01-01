@@ -31,25 +31,8 @@ def finetune(backbone_path, dataset_path, hidden_dim, epochs=10, lr=5e-4, device
     
     model = AuditableHybridGNN(metadata, hidden_dim).to(device)
     
-    # Load Pre-trained weights (only the backbone parts)
-    if os.path.exists(backbone_path):
-        print(f"Loading weights from {backbone_path}")
-        pretrained_dict = torch.load(backbone_path, map_location=device, weights_only=False)
-        model_dict = model.state_dict()
-        
-        # Filter out projection head weights from pre-training script 
-        # and only keep HGT/SGFormer backbone weights
-        valid_pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and "projector" not in k}
-        model_dict.update(valid_pretrained_dict)
-        model.load_state_dict(model_dict)
-        print(f"Successfully loaded {len(valid_pretrained_dict)} backbone layers.")
-    
-    # 2. Freeze Backbone (HGT and SGFormer)
-    for name, param in model.named_parameters():
-        if "query_aligner" not in name and "scoring_head" not in name:
-            param.requires_grad = False
-            
-    print("Backbone frozen. Training only Query Aligner and Scoring Head.")
+    # Use the unified backbone loader
+    model.load_backbone(backbone_path, device=device, freeze=True)
     
     # 3. Setup Tools
     embed_model = NVEmbedV2EmbeddingModel("BAAI/bge-small-en-v1.5")
@@ -66,8 +49,8 @@ def finetune(backbone_path, dataset_path, hidden_dim, epochs=10, lr=5e-4, device
         epoch_loss = 0
         correct_retrievals = 0
         
-        pbar = tqdm(samples, desc=f"Epoch {epoch+1}")
-        for sample in pbar:
+        pbar = tqdm(enumerate(samples), desc=f"Epoch {epoch+1}", total=len(samples))
+        for i, sample in pbar:
             question = sample['question']
             paragraphs = sample['paragraphs']
             
@@ -88,7 +71,6 @@ def finetune(backbone_path, dataset_path, hidden_dim, epochs=10, lr=5e-4, device
             # --- Updated Training Step for Multi-hop ---
 
             # 1. Create a multi-hot target vector
-            # (Example: [0, 1, 0, 0, 1, ...] where indices 1 and 4 are supporting)
             target = torch.zeros(len(paragraphs), device=device)
             for idx in target_indices:
                 target[idx] = 1.0
@@ -102,16 +84,26 @@ def finetune(backbone_path, dataset_path, hidden_dim, epochs=10, lr=5e-4, device
             loss.backward()
             optimizer.step()
 
-            # 4. Metrics (Accuracy means finding ALL or at least one?)
-            # Usually, for retrieval, we check if the Top-K contains our targets
-            
-            # Metrics
+            # --- UPDATED MULTI-HOP METRICS ---
             epoch_loss += loss.item()
-            pred_idx = torch.argmax(scores).item()
-            if pred_idx in target_indices:
+            
+            # Sort scores to get rankings
+            sorted_indices = torch.argsort(scores, descending=True).tolist()
+            
+            # 1. Hit@1 (Strict: was the top choice correct?)
+            if sorted_indices[0] in target_indices:
                 correct_retrievals += 1
-                
-        pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{correct_retrievals/len(samples):.2%}"})            
+            
+            # 2. Recall@5 (Did we find supporting paragraphs in Top 5?)
+            top_5 = sorted_indices[:5]
+            hits_in_top_5 = [idx for idx in target_indices if idx in top_5]
+            recall_5 = len(hits_in_top_5) / len(target_indices)
+            
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}", 
+                'hit@1': f"{correct_retrievals/(i+1):.2%}",
+                'r@5': f"{recall_5:.2%}"
+            })            
         avg_loss = epoch_loss / len(samples)
         accuracy = correct_retrievals / len(samples)
         print(f"Epoch {epoch+1:02d} | Avg Loss: {avg_loss:.4f} | Accuracy: {accuracy:.2%}")
