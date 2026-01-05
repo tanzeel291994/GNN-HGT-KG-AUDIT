@@ -18,7 +18,15 @@ def load_musique_finetune_samples(path: str, limit: int = 500):
     return data[:limit]
 
 # --- 2. FINE-TUNING SCRIPT ---
-def finetune(backbone_path, dataset_path, hidden_dim, epochs=10, lr=5e-4, device='cuda'):
+def finetune(backbone_path, dataset_path, hidden_dim, epochs=10,lr_head=5e-4, lr_backbone=5e-5, device='cpu'):
+    if device is None:
+        if torch.backends.mps.is_available():
+            device = 'mps'
+        elif torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = 'cpu'
+    print(f"Using device: {device}")
     # 1. Initialize Models
     # Note: We need a temporary graph to get metadata for initialization
     # (Just using a placeholder metadata or loading from existing graph)
@@ -39,12 +47,34 @@ def finetune(backbone_path, dataset_path, hidden_dim, epochs=10, lr=5e-4, device
     builder = POCGraphBuilder(embed_model, {"api_key": "", "endpoint": "", "api_version": "", "deployment_name": ""}, cache_path="musique_ie_cache.json")
     
     samples = load_musique_finetune_samples(dataset_path)
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
-    criterion = nn.BCEWithLogitsLoss()
+    #optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    pos_weight = torch.tensor([10.0]).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
+    # 3. Setup Differential Learning Rates
+    # Separate parameters for task-specific heads vs pretrained backbone
+    head_params = []
+    backbone_params = []
+    for name, param in model.named_parameters():
+        if any(x in name for x in ["query_interaction", "scoring_head", "passage_norm"]):
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    optimizer = torch.optim.Adam([
+        {'params': head_params, 'lr': lr_head},
+        {'params': backbone_params, 'lr': lr_backbone}
+    ])
+
     # 4. Training Loop
     print(f"Starting Fine-tuning on {len(samples)} samples...")
     for epoch in range(epochs):
+        # --- PARTIAL UNFREEZING LOGIC ---
+        if epoch == 2: # e.g., Unfreeze the last HGT layer after 2 epochs
+            print(">>> Unfreezing the last HGT layer for fine-tuning...")
+            for param in model.convs[-1].parameters():
+                param.requires_grad = True
+        
         model.train()
         epoch_loss = 0
         correct_retrievals = 0
@@ -59,10 +89,12 @@ def finetune(backbone_path, dataset_path, hidden_dim, epochs=10, lr=5e-4, device
             if not target_indices: continue
             
             # 1. Build Subgraph (The "Minigraph") from the sample's passages
-            doc_texts = [p['paragraph_text'] for p in paragraphs]
-            graph, _ = builder.build_graph(doc_texts)
+            #doc_texts = [p['paragraph_text'] for p in paragraphs]
+            #graph, _ = builder.build_graph(doc_texts)
+            #graph = graph.to(device)
+            # 1. Get or Build Graph (This will be FAST after the 1st epoch)
+            graph = get_or_build_graph(sample, builder, storage_dir="graph_storage")
             graph = graph.to(device)
-            
             # 2. Get Query Embedding
             query_emb = torch.from_numpy(embed_model.batch_encode([question], instruction="query")).to(device)
             
@@ -113,10 +145,37 @@ def finetune(backbone_path, dataset_path, hidden_dim, epochs=10, lr=5e-4, device
 
     print("Fine-tuning completed.")
 
+import os
+import torch
+from hashlib import md5
+
+def get_sample_hash(sample):
+    # Create a unique ID based on the question and the set of paragraph texts
+    content = sample['question'] + "".join([p['paragraph_text'] for p in sample['paragraphs']])
+    return md5(content.encode()).hexdigest()
+
+def get_or_build_graph(sample, builder, storage_dir="graph_storage"):
+    if not os.path.exists(storage_dir):
+        os.makedirs(storage_dir)
+        
+    sample_hash = get_sample_hash(sample)
+    graph_path = os.path.join(storage_dir, f"{sample_hash}.pt")
+    
+    if os.path.exists(graph_path):
+        # Load from disk
+        return torch.load(graph_path, weights_only=False)
+    else:
+        # Build from scratch
+        doc_texts = [p['paragraph_text'] for p in sample['paragraphs']]
+        graph, _ = builder.build_graph(doc_texts)
+        # Save to disk for next time
+        torch.save(graph, graph_path)
+        return graph
+
 if __name__ == "__main__":
     BACKBONE_PATH = "pretrained_gnn_final.pth"
-    DATASET_PATH = "dataset/musique_all.json"
+    DATASET_PATH = "new_datasets/train_samples.json"
     HIDDEN_DIM = 384
     
-    finetune(BACKBONE_PATH, DATASET_PATH, HIDDEN_DIM, epochs=5, device='cuda')
+    finetune(BACKBONE_PATH, DATASET_PATH, HIDDEN_DIM, epochs=5)
 

@@ -36,38 +36,40 @@ class PretrainableHeteroGNN(nn.Module):
         )
         
         # 3. Projection Head for Contrastive Learning # why all projection head look like this ???
-        self.projector = nn.Sequential(
-            nn.Linear(hidden_dim, out_dim),
-            nn.ReLU(),
-            nn.Linear(out_dim, out_dim)
+        # [FIX] Separate Projectors for distinct semantic spaces
+        self.entity_projector = nn.Sequential(
+            nn.Linear(hidden_dim, out_dim), nn.ReLU(), nn.Linear(out_dim, out_dim)
+        )
+        self.passage_projector = nn.Sequential(
+            nn.Linear(hidden_dim, out_dim), nn.ReLU(), nn.Linear(out_dim, out_dim)
         )
 
-    def forward(self, x_dict, edge_index_dict, batch_dict=None):
-        # Local HGT structural pass
+    def forward(self, x_dict, edge_index_dict, batch_dict=None, return_h=False):
+        # 1. Message Passing (Update ALL node types)
         h_dict = x_dict
         for conv in self.convs:
             h_dict = conv(h_dict, edge_index_dict)
-            h_dict = {k: F.gelu(v) for k, v in h_dict.items()} #Gaussian Error Linear Unit is a non-linear activation function that is used to introduce non-linearity into the model.
+            h_dict = {k: F.gelu(v) for k, v in h_dict.items()} 
         
-        # Focus on 'entity' nodes for global reasoning and contrastive learning
+        # 2. Entity Reasoning (Same as before)
         h_local_ent = h_dict['entity']
-        
-        # Construct batch vector for SGFormer (all nodes in this sub-graph view belong to same 'batch')
-        # If batch_dict is provided, use it, otherwise assume all nodes belong to one example (zeros)
-        # why this is needed ???
         batch_ent = h_local_ent.new_zeros(h_local_ent.size(0), dtype=torch.long)
-        # Empty edge index for SGFormer global-only mode
-        #empty_edge_index = torch.empty((2, 0), dtype=torch.long, device=h_local_ent.device)
-        # Global SGFormer track
-        h_ent_global = self.entity_global_reasoner.trans_conv(h_local_ent, batch_ent) #activateing only its trans_conv layer
+        h_ent_global = self.entity_global_reasoner.trans_conv(h_local_ent, batch_ent)
+        h_dict['entity'] = self.entity_norm((1 - self.alpha) * h_local_ent + self.alpha * h_ent_global)
+
+        if return_h:
+            return h_dict # Return dict to access both entity and passage later
+
+        # [FIX] Project BOTH types
+        # We perform contrastive learning on both critical node types
+        z_entity = self.entity_projector(h_dict['entity'])
         
-        # 3. Hybrid Blend (Alpha Residual) - Matching your POC code
-        #alpha = 0.1 
-        # This keeps 90% local info and adds 10% global info
-        h_dict['entity'] = self.entity_norm((1 - self.alpha) * h_local_ent + self.alpha * h_ent_global)        
-        # 4. Project for Contrastive Loss
-        z = self.projector(h_dict['entity'])
-        return z
+        # Check if batch contains passages (it might not if using HGTLoader strictly)
+        if 'passage' in h_dict and h_dict['passage'].size(0) > 0:
+            z_passage = self.passage_projector(h_dict['passage'])
+            return {'entity': z_entity, 'passage': z_passage}
+            
+        return {'entity': z_entity, 'passage': None}
 
 # --- 2. DATA AUGMENTATION ---
 def get_graph_augmentation(data: HeteroData, node_mask_rate=0.1, edge_drop_rate=0.1):
@@ -141,7 +143,7 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
         data,
         num_samples=[2048, 1024], # Increased budget to provide structural context
         batch_size=batch_size,
-        input_nodes='entity',
+        input_nodes='passage',
         shuffle=True,
         num_workers=8,
         persistent_workers=True
@@ -162,18 +164,42 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
         for batch in pbar:
             optimizer.zero_grad()
             
-            # Use actual batch size for slicing (important for the last batch)
-            curr_batch_size = batch['entity'].batch_size
+            # [FIX 1] Get batch size from 'passage' (the new input node)
+            curr_batch_size = batch['passage'].batch_size
             
-            # Generate views and move to device (standard float32)
+            # Generate views
             view1 = get_graph_augmentation(batch).to(device)
             view2 = get_graph_augmentation(batch).to(device)
             
-            # Run in pure float32 for maximum compatibility with pyg-lib kernels
-            z1 = model(view1.x_dict, view1.edge_index_dict)[:curr_batch_size]
-            z2 = model(view2.x_dict, view2.edge_index_dict)[:curr_batch_size]
+            # Run Model
+            out1 = model(view1.x_dict, view1.edge_index_dict)
+            out2 = model(view2.x_dict, view2.edge_index_dict)
             
-            loss = contrastive_loss(z1, z2)
+            # [FIX 2] Calculate Loss on Passages (Primary Objective)
+            # We slice [:curr_batch_size] to only train on the "Seed" passages, 
+            # ignoring the neighbor nodes pulled in for context.
+            z1_passage = out1['passage'][:curr_batch_size]
+            z2_passage = out2['passage'][:curr_batch_size]
+            
+            loss_passage = contrastive_loss(z1_passage, z2_passage)
+            
+            # [OPTIONAL] Add Entity Loss if you want to keep entity reasoning strong
+            # We use ALL entities in the subgraph since they don't have a specific batch order
+            # or we can skip it to focus purely on passages.
+            if out1['entity'] is not None:
+                # Simple full-graph contrastive for entities (lighter weight)
+                z1_ent = out1['entity']
+                z2_ent = out2['entity']
+                # Downsample if too many entities to save memory
+                if z1_ent.size(0) > 2000:
+                    idx = torch.randperm(z1_ent.size(0))[:2000]
+                    z1_ent = z1_ent[idx]
+                    z2_ent = z2_ent[idx]
+                
+                loss_entity = contrastive_loss(z1_ent, z2_ent)
+                loss = loss_passage + (0.1 * loss_entity) # Small weight for entities
+            else:
+                loss = loss_passage
             
             loss.backward()
             optimizer.step()
@@ -183,7 +209,7 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
             pbar.set_postfix({'loss': f"{loss.item():.4f}"})
             
             # Aggressive cleanup for large embeddings
-            del view1, view2, z1, z2, batch
+            #del view1, view2, z1, z2, batch
             #if num_batches % 20 == 0:
             #    torch.cuda.empty_cache()
 
@@ -199,7 +225,7 @@ def pretrain(graph_path, hidden_dim, out_dim, epochs=10, lr=1e-3, device='cuda',
 
 if __name__ == "__main__":
     #GRAPH_PATH = "/home/ubuntu/gnn-hgt/GNN-HGT-KG-AUDIT/kg_storage/global_graph.pt"
-    GRAPH_PATH = "/home/ubuntu/gnn-hgt/GNN-HGT-KG-AUDIT/kg_storage/global_graph_bge_small.pt"
+    GRAPH_PATH = "/Users/tanzeel.shaikh/Sources/Projects/GNN-HGT/kg_storage/global_graph_bge_small.pt"
 
     HIDDEN_DIM = 384 # Updated for NVIDIA NV-Embed-v2
     OUT_DIM = 128     # Contrastive projection dimension

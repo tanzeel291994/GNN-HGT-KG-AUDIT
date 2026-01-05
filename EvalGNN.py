@@ -8,6 +8,9 @@ from AuditableHybridGNN_POC import AuditableHybridGNN, POCGraphBuilder, NVEmbedV
 from tqdm import tqdm
 import numpy as np
 
+from FineTuneGNN import get_or_build_graph
+from construct_kg import GlobalKGManager
+
 # --- 1. DATA LOADING FOR EVALUATION ---
 def load_musique_eval_samples(path: str, limit: int = 200):
     if not os.path.exists(path):
@@ -18,7 +21,7 @@ def load_musique_eval_samples(path: str, limit: int = 200):
     return data[:limit]
 
 # --- 2. EVALUATION SCRIPT ---
-def evaluate(model_path, dataset_path, hidden_dim, device='cuda', k_list=[1, 3, 5, 10]):
+def evaluate(model_path, dataset_path, hidden_dim, device='cuda', k_list=[2, 3, 5, 10]):
     print("Initializing Model and loading fine-tuned weights...")
     
     # Load metadata for initialization
@@ -38,7 +41,13 @@ def evaluate(model_path, dataset_path, hidden_dim, device='cuda', k_list=[1, 3, 
     
     # Setup Tools
     embed_model = NVEmbedV2EmbeddingModel("BAAI/bge-small-en-v1.5")
-    builder = POCGraphBuilder(embed_model, {"api_key": "", "endpoint": "", "api_version": "", "deployment_name": ""}, cache_path="musique_ie_cache.json")
+    azure_config = {
+        "api_key": "db8dac9cea3148d48c348ed46e9bfb2d",
+        "endpoint": "https://bodeu-des-csv02.openai.azure.com/",
+        "api_version": "2024-12-01-preview", 
+        "deployment_name": "gpt-4o-mini" 
+    }    
+    builder = POCGraphBuilder(embed_model,azure_config, cache_path="musique_ie_cache.json")
     
     samples = load_musique_eval_samples(dataset_path)
     print(f"Evaluating on {len(samples)} samples from {dataset_path}...")
@@ -46,23 +55,68 @@ def evaluate(model_path, dataset_path, hidden_dim, device='cuda', k_list=[1, 3, 
     recalls = {k: [] for k in k_list}
     mrr = []
     all_hops_found = {k: [] for k in k_list}
-    
+    manager = GlobalKGManager()
+    global_graph, metadata = manager.load_kg()
+    # HYDRATE THE BUILDER: This is the critical fix
+    # Ensure the builder knows the entity mapping used in the global graph
+    builder.entity_to_idx = metadata['entity_to_idx']
+    # Reconstruct unique_entities list from the mapping to allow index-based printing
+    builder.unique_entities = [None] * len(metadata['entity_to_idx'])
+    for ent, idx in metadata['entity_to_idx'].items():
+        builder.unique_entities[idx] = ent
+
+    doc_to_idx = metadata['doc_to_idx'] # Map: paragraph_text -> global_index
+
     with torch.no_grad():
-        pbar = tqdm(samples, desc="Evaluating")
+        pbar = tqdm(samples[:1], desc="Evaluating")
         for sample in pbar:
             question = sample['question']
-            paragraphs = sample['paragraphs']
+            target_global_indices = []
+            for p in sample['paragraphs']:
+                if p.get('is_supporting', False):
+                    p_text = p['paragraph_text']
+                    if p_text in doc_to_idx:
+                        target_global_indices.append(doc_to_idx[p_text])
             
-            target_indices = [idx for idx, p in enumerate(paragraphs) if p['is_supporting']]
-            if not target_indices: continue
+            # Convert to set for O(1) lookup
+            target_indices = set(target_global_indices)
             
-            # 1. Build Subgraph from the sample
-            doc_texts = [p['paragraph_text'] for p in paragraphs]
-            graph, _ = builder.build_graph(doc_texts)
+
+            # --- NEW SUBGRAPH EXTRACTION LOGIC ---
+            # Step A: Get Query Embedding
+            query_emb = torch.from_numpy(embed_model.batch_encode([question], instruction="query")).to(device)
+            
+            # Step B: Identify Anchor Entities (Physical + Semantic)
+            anchors = builder.extract_query_anchors(question)
+            print(f"Anchors: {anchors}")
+            # Step C: Extract Subgraph from Global Graph (Algorithm 5 Hybrid)
+            graph = builder.build_attention_guided_subgraph(
+                global_graph, 
+                anchors, 
+                query_emb=query_emb
+                #k_semantic=50
+            )
+            
+            if graph is None:
+                # Handle cases where no anchors are found
+                print(f"No anchors found for question: {question}")
+                continue
+            
             graph = graph.to(device)
             
+            # Step D: Forward Pass
+            #scores = model(graph.x_dict, graph.edge_index_dict, query_emb)
+
+
+            # 1. Build Subgraph from the sample
+            #doc_texts = [p['paragraph_text'] for p in paragraphs]
+            #graph, _ = builder.build_graph(doc_texts)
+            #graph = graph.to(device)
+            # 1. Get or Build Graph (This will be FAST after the 1st epoch)
+            #graph = get_or_build_graph(sample, builder, storage_dir="graph_storage")
+            #graph = graph.to(device)
             # 2. Get Query Embedding
-            query_emb = torch.from_numpy(embed_model.batch_encode([question], instruction="query")).to(device)
+            #query_emb = torch.from_numpy(embed_model.batch_encode([question], instruction="query")).to(device)
             
             # 3. Forward Pass
             scores = model(graph.x_dict, graph.edge_index_dict, query_emb)
@@ -71,19 +125,24 @@ def evaluate(model_path, dataset_path, hidden_dim, device='cuda', k_list=[1, 3, 
             # 4. Rank indices
             # Applying sigmoid because we used BCEWithLogitsLoss
             probs = torch.sigmoid(scores)
-            sorted_indices = torch.argsort(probs, descending=True).tolist()
+            sorted_local_indices = torch.argsort(probs, descending=True).tolist()
+            
+            # CRITICAL FIX: Map local subgraph indices back to global IDs
+            # graph['passage'].n_id contains the mapping [local_idx] -> global_idx
+            subgraph_global_ids = graph['passage'].n_id.tolist()
+            sorted_global_indices = [subgraph_global_ids[idx] for idx in sorted_local_indices]
             
             # 5. Calculate Metrics
             # MRR Calculation (for the first supporting paragraph found)
             rank = 999
-            for i, idx in enumerate(sorted_indices):
+            for i, idx in enumerate(sorted_global_indices):
                 if idx in target_indices:
                     rank = i + 1
                     break
             mrr.append(1.0 / rank if rank != 999 else 0.0)
             
             for k in k_list:
-                top_k_indices = sorted_indices[:k]
+                top_k_indices = sorted_global_indices[:k]
                 
                 # Recall@K: Did we find ANY of the supporting paragraphs?
                 hits = [1 for idx in target_indices if idx in top_k_indices]
@@ -101,11 +160,15 @@ def evaluate(model_path, dataset_path, hidden_dim, device='cuda', k_list=[1, 3, 
         print(f"Recall@{k}: {np.mean(recalls[k]):.2%}")
         print(f"Complete-Retrieval@{k}: {np.mean(all_hops_found[k]):.2%}")
     print("---------------------------------")
+    # At the very end of evaluate() in EvalGNN.py
+    print("Saving updated IE cache...")
+    builder._save_cache()
+    print("Evaluation completed.")
 
 if __name__ == "__main__":
-    MODEL_PATH = "finetuned_gnn_epoch_5.pth" # Update this to your best epoch
-    DATASET_PATH = "dataset/musique_eval.json"
+    MODEL_PATH = "models/fine-tuned/finetuned_gnn_epoch_5.pth" # Update this to your best epoch
+    DATASET_PATH = "new_datasets/eval_samples.json"
     HIDDEN_DIM = 384
     
-    evaluate(MODEL_PATH, DATASET_PATH, HIDDEN_DIM, device='cuda')
+    evaluate(MODEL_PATH, DATASET_PATH, HIDDEN_DIM, device='cpu')
 
